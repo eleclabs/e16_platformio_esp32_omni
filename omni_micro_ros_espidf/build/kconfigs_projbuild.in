@@ -1,0 +1,7 @@
+source "/home/eleclabs/esp/esp-idf/components/bootloader/Kconfig.projbuild"
+source "/home/eleclabs/esp/esp-idf/components/esp_app_format/Kconfig.projbuild"
+source "/home/eleclabs/esp/esp-idf/components/esp_rom/Kconfig.projbuild"
+source "/home/eleclabs/esp/esp-idf/components/esptool_py/Kconfig.projbuild"
+source "/home/eleclabs/esp/esp-idf/components/partition_table/Kconfig.projbuild"
+source "/home/eleclabs/platformio/esp32/omni_micro_ros_espidf/main/Kconfig.projbuild"
+source "/home/eleclabs/platformio/esp32/omni_micro_ros_espidf/managed_components/micro-ros__micro_ros_espidf_component/Kconfig.projbuild"

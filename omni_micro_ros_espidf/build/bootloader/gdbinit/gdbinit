@@ -1,0 +1,2 @@
+source /home/eleclabs/platformio/esp32/omni_micro_ros_espidf/build/bootloader/gdbinit/symbols
+source /home/eleclabs/platformio/esp32/omni_micro_ros_espidf/build/bootloader/gdbinit/connect

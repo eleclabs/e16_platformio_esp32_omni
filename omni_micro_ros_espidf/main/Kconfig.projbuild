@@ -1,0 +1,11 @@
+menu "Omni micro-ROS application"
+
+config MICRO_ROS_APP_STACK
+    int "micro-ROS task stack size"
+    default 16000
+
+config MICRO_ROS_APP_TASK_PRIO
+    int "micro-ROS task priority"
+    default 5
+
+endmenu

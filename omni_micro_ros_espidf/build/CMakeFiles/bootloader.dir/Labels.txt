@@ -1,0 +1,13 @@
+# Target labels
+ bootloader
+# Source files and their labels
+/home/eleclabs/platformio/esp32/omni_micro_ros_espidf/build/CMakeFiles/bootloader
+/home/eleclabs/platformio/esp32/omni_micro_ros_espidf/build/CMakeFiles/bootloader.rule
+/home/eleclabs/platformio/esp32/omni_micro_ros_espidf/build/CMakeFiles/bootloader-complete.rule
+/home/eleclabs/platformio/esp32/omni_micro_ros_espidf/build/bootloader-prefix/src/bootloader-stamp/bootloader-build.rule
+/home/eleclabs/platformio/esp32/omni_micro_ros_espidf/build/bootloader-prefix/src/bootloader-stamp/bootloader-configure.rule
+/home/eleclabs/platformio/esp32/omni_micro_ros_espidf/build/bootloader-prefix/src/bootloader-stamp/bootloader-download.rule
+/home/eleclabs/platformio/esp32/omni_micro_ros_espidf/build/bootloader-prefix/src/bootloader-stamp/bootloader-install.rule
+/home/eleclabs/platformio/esp32/omni_micro_ros_espidf/build/bootloader-prefix/src/bootloader-stamp/bootloader-mkdir.rule
+/home/eleclabs/platformio/esp32/omni_micro_ros_espidf/build/bootloader-prefix/src/bootloader-stamp/bootloader-patch.rule
+/home/eleclabs/platformio/esp32/omni_micro_ros_espidf/build/bootloader-prefix/src/bootloader-stamp/bootloader-update.rule

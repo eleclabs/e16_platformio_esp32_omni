@@ -1,0 +1,465 @@
+#include <Arduino.h>
+#include "omni_config.h"
+#include <Wire.h>
+#include <WiFi.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <micro_ros_platformio.h>
+#include <rcl/rcl.h>
+#include <rclc/rclc.h>
+#include <rclc/executor.h>
+#include <std_msgs/msg/float64_multi_array.h>
+#include <sensor_msgs/msg/imu.h>
+#include "driver/pcnt.h"
+#include <rmw_microros/rmw_microros.h>
+#include <esp_task_wdt.h>
+
+// ============================================================
+// Omni 3-wheel base: ESP32-S3 + 3x TB6612 + 3x AB encoders
+//                       + MPU6050 IMU
+// ROS 2:
+//   SUB /wheel_velocity_cmd       std_msgs/Float64MultiArray [rad/s]
+//   PUB /wheel_velocity_feedback  std_msgs/Float64MultiArray [rad/s]
+//   PUB /imu/data_raw              sensor_msgs/Imu
+// ============================================================
+
+// ---------------- Network ----------------
+static const char *WIFI_SSID = OMNI_WIFI_SSID;
+static const char *WIFI_PASSWORD = OMNI_WIFI_PASSWORD;
+static IPAddress AGENT_IP(
+  OMNI_AGENT_IP_0, OMNI_AGENT_IP_1, OMNI_AGENT_IP_2, OMNI_AGENT_IP_3);
+static constexpr uint16_t AGENT_PORT = OMNI_AGENT_PORT;
+
+// ---------------- Robot ----------------
+static constexpr float MOTOR_RPM = OMNI_MOTOR_RPM;
+static constexpr float MAX_WHEEL_RAD_S = MOTOR_RPM * 2.0f * PI / 60.0f;
+static constexpr float WHEEL_RADIUS_M = OMNI_WHEEL_RADIUS_M;
+
+// 500 P/R/channel × x4 quadrature = 2000 counts/rev.
+// Change to 500 if the datasheet defines 500 CPR after quadrature decoding.
+static constexpr float ENCODER_PPR = OMNI_ENCODER_PPR;
+static constexpr float QUADRATURE_COUNTS_PER_REV = OMNI_ENCODER_COUNTS_PER_REV;
+
+// ---------------- TB6612 ----------------
+static constexpr const int *PWM_PINS = OMNI_PWM_PINS;
+static constexpr const int *DIR1_PINS = OMNI_DIR1_PINS;
+static constexpr const int *DIR2_PINS = OMNI_DIR2_PINS;
+static constexpr int STBY_PIN = OMNI_STBY_PIN;
+
+// ---------------- Encoder ----------------
+static constexpr const int *ENC_A_PINS = OMNI_ENC_A_PINS;
+static constexpr const int *ENC_B_PINS = OMNI_ENC_B_PINS;
+static constexpr const int *MOTOR_SIGN = OMNI_MOTOR_SIGN;
+static constexpr uint8_t PWM_CHANNELS[3] = {0, 1, 2};
+static constexpr const int *ENCODER_SIGN = OMNI_ENCODER_SIGN;
+
+// ---------------- MPU6050 ----------------
+// Default I2C pins for the project. Change to match wiring.
+static constexpr int I2C_SDA_PIN = OMNI_I2C_SDA_PIN;
+static constexpr int I2C_SCL_PIN = OMNI_I2C_SCL_PIN;
+static constexpr uint8_t MPU6050_ADDRESS = OMNI_MPU6050_ADDRESS;  // 0x69 when AD0 = HIGH
+static constexpr uint32_t IMU_PERIOD_MS = OMNI_IMU_PERIOD_MS;     // 100 Hz
+static constexpr float GRAVITY_MPS2 = 9.80665f;
+
+Adafruit_MPU6050 mpu;
+bool imu_ready = false;
+float gyro_bias_x = 0.0f;
+float gyro_bias_y = 0.0f;
+float gyro_bias_z = 0.0f;
+
+// ---------------- Control ----------------
+static constexpr uint32_t PWM_FREQ = OMNI_PWM_FREQ;
+static constexpr uint8_t PWM_RESOLUTION = OMNI_PWM_RESOLUTION;
+static constexpr int PWM_MAX = (1 << PWM_RESOLUTION) - 1;
+static constexpr uint32_t CONTROL_PERIOD_MS = OMNI_CONTROL_PERIOD_MS;
+static constexpr uint32_t FEEDBACK_PERIOD_MS = OMNI_FEEDBACK_PERIOD_MS;
+static constexpr uint32_t COMMAND_TIMEOUT_MS = OMNI_COMMAND_TIMEOUT_MS;
+static constexpr uint32_t WATCHDOG_TIMEOUT_SEC = 2;
+
+struct PID {
+  float kp;
+  float ki;
+  float kd;
+  float integral;
+  float previous_error;
+};
+
+PID pid[3] = {
+  {OMNI_PID_KP, OMNI_PID_KI, OMNI_PID_KD, 0.0f, 0.0f},
+  {OMNI_PID_KP, OMNI_PID_KI, OMNI_PID_KD, 0.0f, 0.0f},
+  {OMNI_PID_KP, OMNI_PID_KI, OMNI_PID_KD, 0.0f, 0.0f},
+};
+
+float target_rad_s[3] = {0, 0, 0};
+float measured_rad_s[3] = {0, 0, 0};
+float output_rad_s[3] = {0, 0, 0};
+// PCNT counters are cleared every control cycle after reading. This prevents
+// the 16-bit hardware counter from overflowing during long/high-speed runs.
+
+// ---------------- ESP-IDF PCNT ----------------
+static constexpr pcnt_unit_t pcnt_units[3] = {
+  PCNT_UNIT_0, PCNT_UNIT_1, PCNT_UNIT_2
+};
+
+// ---------------- micro-ROS ----------------
+rcl_allocator_t allocator;
+rclc_support_t support;
+rcl_node_t node;
+rcl_publisher_t feedback_pub;
+rcl_publisher_t imu_pub;
+rcl_subscription_t cmd_sub;
+rclc_executor_t executor;
+
+std_msgs__msg__Float64MultiArray cmd_msg;
+std_msgs__msg__Float64MultiArray feedback_msg;
+sensor_msgs__msg__Imu imu_msg;
+bool ros_ready = false;
+
+uint32_t last_control_ms = 0;
+uint32_t last_feedback_ms = 0;
+uint32_t last_imu_ms = 0;
+uint32_t last_command_ms = 0;
+
+static void fatal_stop() {
+  digitalWrite(STBY_PIN, LOW);
+  for (int i = 0; i < 3; ++i) {
+    digitalWrite(DIR1_PINS[i], LOW);
+    digitalWrite(DIR2_PINS[i], LOW);
+    ledcWrite(PWM_CHANNELS[i], 0);
+  }
+  Serial.println("FATAL STOP: motors disabled");
+  while (true) {
+    delay(1000);
+  }
+}
+
+static void check_esp_err(esp_err_t err) {
+  if (err != ESP_OK) {
+    Serial.printf("PCNT error: %s\n", esp_err_to_name(err));
+    fatal_stop();
+  }
+}
+
+#define RCCHECK(fn) do { rcl_ret_t rc = fn; if (rc != RCL_RET_OK) { fatal_stop(); } } while (0)
+#define RCSOFTCHECK(fn) do { (void)(fn); } while (0)
+
+void init_pcnt() {
+  for (int i = 0; i < 3; ++i) {
+    pcnt_config_t a_config = {};
+    a_config.pulse_gpio_num = ENC_A_PINS[i];
+    a_config.ctrl_gpio_num = ENC_B_PINS[i];
+    a_config.lctrl_mode = PCNT_MODE_KEEP;
+    a_config.hctrl_mode = PCNT_MODE_REVERSE;
+    a_config.pos_mode = PCNT_COUNT_INC;
+    a_config.neg_mode = PCNT_COUNT_DEC;
+    a_config.counter_h_lim = 32767;
+    a_config.counter_l_lim = -32768;
+    a_config.unit = pcnt_units[i];
+    a_config.channel = PCNT_CHANNEL_0;
+    check_esp_err(pcnt_unit_config(&a_config));
+
+    pcnt_config_t b_config = {};
+    b_config.pulse_gpio_num = ENC_B_PINS[i];
+    b_config.ctrl_gpio_num = ENC_A_PINS[i];
+    b_config.lctrl_mode = PCNT_MODE_KEEP;
+    b_config.hctrl_mode = PCNT_MODE_REVERSE;
+    b_config.pos_mode = PCNT_COUNT_DEC;
+    b_config.neg_mode = PCNT_COUNT_INC;
+    b_config.counter_h_lim = 32767;
+    b_config.counter_l_lim = -32768;
+    b_config.unit = pcnt_units[i];
+    b_config.channel = PCNT_CHANNEL_1;
+    check_esp_err(pcnt_unit_config(&b_config));
+
+    check_esp_err(pcnt_counter_pause(pcnt_units[i]));
+    check_esp_err(pcnt_counter_clear(pcnt_units[i]));
+    check_esp_err(pcnt_counter_resume(pcnt_units[i]));
+  }
+}
+
+int32_t read_encoder_delta(int i) {
+  int16_t value = 0;
+  if (pcnt_get_counter_value(pcnt_units[i], &value) != ESP_OK) return 0;
+  (void)pcnt_counter_clear(pcnt_units[i]);
+  return (int32_t)value * ENCODER_SIGN[i];
+}
+
+void set_motor(int i, float command_rad_s) {
+  command_rad_s = constrain(command_rad_s, -MAX_WHEEL_RAD_S, MAX_WHEEL_RAD_S);
+  const float magnitude = fabsf(command_rad_s) / MAX_WHEEL_RAD_S;
+  const int duty = constrain((int)lroundf(magnitude * PWM_MAX), 0, PWM_MAX);
+  const bool forward = (command_rad_s * MOTOR_SIGN[i]) >= 0.0f;
+
+  if (duty == 0) {
+    digitalWrite(DIR1_PINS[i], LOW);
+    digitalWrite(DIR2_PINS[i], LOW);
+    ledcWrite(PWM_CHANNELS[i], 0);
+    return;
+  }
+
+  digitalWrite(DIR1_PINS[i], forward ? HIGH : LOW);
+  digitalWrite(DIR2_PINS[i], forward ? LOW : HIGH);
+  ledcWrite(PWM_CHANNELS[i], duty);
+}
+
+void stop_all_motors() {
+  for (int i = 0; i < 3; ++i) {
+    set_motor(i, 0.0f);
+    pid[i].integral = 0.0f;
+    pid[i].previous_error = 0.0f;
+    output_rad_s[i] = 0.0f;
+    target_rad_s[i] = 0.0f;
+  }
+}
+
+void command_callback(const void *msgin) {
+  const auto *msg = static_cast<const std_msgs__msg__Float64MultiArray *>(msgin);
+  if (msg->data.size < 3 || msg->data.data == nullptr) {
+    stop_all_motors();
+    return;
+  }
+
+  for (int i = 0; i < 3; ++i) {
+    const float command = (float)msg->data.data[i];
+    if (!isfinite(command)) {
+      stop_all_motors();
+      return;
+    }
+    target_rad_s[i] = constrain(command, -MAX_WHEEL_RAD_S, MAX_WHEEL_RAD_S);
+  }
+  last_command_ms = millis();
+}
+
+void init_imu() {
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  Wire.setClock(400000);
+
+  if (!mpu.begin(MPU6050_ADDRESS, &Wire)) {
+    Serial.println("MPU6050 not found");
+    imu_ready = false;
+    return;
+  }
+
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+
+  // Warm-up / stationary bias calibration.
+  const int samples = OMNI_IMU_CALIBRATION_SAMPLES;
+  double sx = 0, sy = 0, sz = 0;
+  sensors_event_t a, g, temp;
+  for (int i = 0; i < samples; ++i) {
+    mpu.getEvent(&a, &g, &temp);
+    sx += g.gyro.x;
+    sy += g.gyro.y;
+    sz += g.gyro.z;
+    delay(2);
+  }
+  gyro_bias_x = sx / samples;
+  gyro_bias_y = sy / samples;
+  gyro_bias_z = sz / samples;
+
+  imu_msg.header.frame_id.data = const_cast<char *>("imu_link");
+  imu_msg.header.frame_id.size = strlen("imu_link");
+  imu_msg.header.frame_id.capacity = imu_msg.header.frame_id.size + 1;
+
+  // No magnetometer on MPU6050: orientation quaternion is not estimated here.
+  // ROS convention: orientation_covariance[0] = -1 means orientation unavailable.
+  imu_msg.orientation_covariance[0] = -1.0;
+  imu_msg.orientation_covariance[4] = 0.0;
+  imu_msg.orientation_covariance[8] = 0.0;
+
+  imu_msg.angular_velocity_covariance[0] = 0.02 * 0.02;
+  imu_msg.angular_velocity_covariance[4] = 0.02 * 0.02;
+  imu_msg.angular_velocity_covariance[8] = 0.02 * 0.02;
+  imu_msg.linear_acceleration_covariance[0] = 0.10 * 0.10;
+  imu_msg.linear_acceleration_covariance[4] = 0.10 * 0.10;
+  imu_msg.linear_acceleration_covariance[8] = 0.10 * 0.10;
+
+  imu_ready = true;
+  Serial.printf("MPU6050 ready. gyro bias [%.5f %.5f %.5f] rad/s\n",
+                gyro_bias_x, gyro_bias_y, gyro_bias_z);
+}
+
+void publish_imu() {
+  if (!ros_ready || !imu_ready) return;
+
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+
+  // Adafruit MPU6050 library reports gyro in rad/s and acceleration in m/s^2.
+  const int64_t epoch_ms = rmw_uros_epoch_millis();
+  imu_msg.header.stamp.sec = (int32_t)(epoch_ms / 1000LL);
+  imu_msg.header.stamp.nanosec = (uint32_t)((epoch_ms % 1000LL) * 1000000LL);
+
+  imu_msg.linear_acceleration.x = a.acceleration.x;
+  imu_msg.linear_acceleration.y = a.acceleration.y;
+  imu_msg.linear_acceleration.z = a.acceleration.z;
+
+  imu_msg.angular_velocity.x = g.gyro.x - gyro_bias_x;
+  imu_msg.angular_velocity.y = g.gyro.y - gyro_bias_y;
+  imu_msg.angular_velocity.z = g.gyro.z - gyro_bias_z;
+
+  // MPU6050 has no magnetometer, so absolute yaw is not available.
+  // Orientation is intentionally unavailable on MPU6050-only hardware.
+  imu_msg.orientation.w = 0.0;
+  imu_msg.orientation.x = 0.0;
+  imu_msg.orientation.y = 0.0;
+  imu_msg.orientation.z = 0.0;
+
+  RCSOFTCHECK(rcl_publish(&imu_pub, &imu_msg, nullptr));
+}
+
+void setup_pins() {
+  pinMode(STBY_PIN, OUTPUT);
+  digitalWrite(STBY_PIN, LOW);
+
+  for (int i = 0; i < 3; ++i) {
+    pinMode(DIR1_PINS[i], OUTPUT);
+    pinMode(DIR2_PINS[i], OUTPUT);
+    digitalWrite(DIR1_PINS[i], LOW);
+    digitalWrite(DIR2_PINS[i], LOW);
+    ledcSetup(PWM_CHANNELS[i], PWM_FREQ, PWM_RESOLUTION);
+    ledcAttachPin(PWM_PINS[i], PWM_CHANNELS[i]);
+    ledcWrite(PWM_CHANNELS[i], 0);
+  }
+
+  digitalWrite(STBY_PIN, HIGH);
+}
+
+void update_velocity_measurement(float dt) {
+  for (int i = 0; i < 3; ++i) {
+    const int32_t delta = read_encoder_delta(i);
+    measured_rad_s[i] = ((float)delta / QUADRATURE_COUNTS_PER_REV) * (2.0f * PI) / dt;
+  }
+}
+
+void update_pid(float dt) {
+  const bool timeout = (millis() - last_command_ms) > COMMAND_TIMEOUT_MS;
+
+  if (timeout) {
+    for (int i = 0; i < 3; ++i) target_rad_s[i] = 0.0f;
+  }
+
+  for (int i = 0; i < 3; ++i) {
+    if (!(dt > 0.0001f) || !isfinite(dt)) {
+      stop_all_motors();
+      return;
+    }
+    const float error = target_rad_s[i] - measured_rad_s[i];
+    pid[i].integral += error * dt;
+    pid[i].integral = constrain(
+      pid[i].integral, -OMNI_PID_INTEGRAL_LIMIT, OMNI_PID_INTEGRAL_LIMIT);
+    const float derivative = (error - pid[i].previous_error) / dt;
+    const float correction = pid[i].kp * error + pid[i].ki * pid[i].integral + pid[i].kd * derivative;
+    pid[i].previous_error = error;
+
+    output_rad_s[i] = constrain(target_rad_s[i] + correction, -MAX_WHEEL_RAD_S, MAX_WHEEL_RAD_S);
+    set_motor(i, output_rad_s[i]);
+  }
+
+  if (timeout) stop_all_motors();
+}
+
+void publish_feedback() {
+  if (!ros_ready) return;
+  for (int i = 0; i < 3; ++i) feedback_msg.data.data[i] = measured_rad_s[i];
+  RCSOFTCHECK(rcl_publish(&feedback_pub, &feedback_msg, nullptr));
+}
+
+bool init_micro_ros() {
+  set_microros_wifi_transports(
+    const_cast<char *>(WIFI_SSID),
+    const_cast<char *>(WIFI_PASSWORD),
+    AGENT_IP,
+    AGENT_PORT);
+  delay(2000);
+
+  allocator = rcl_get_default_allocator();
+  RCCHECK(rclc_support_init(&support, 0, nullptr, &allocator));
+  RCCHECK(rclc_node_init_default(&node, "omni_esp32s3_base", "", &support));
+
+  RCCHECK(rclc_publisher_init_default(
+    &feedback_pub, &node,
+    ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float64MultiArray),
+    "/wheel_velocity_feedback"));
+
+  RCCHECK(rclc_publisher_init_default(
+    &imu_pub, &node,
+    ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Imu),
+    "/imu/data_raw"));
+
+  RCCHECK(rclc_subscription_init_default(
+    &cmd_sub, &node,
+    ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float64MultiArray),
+    "/wheel_velocity_cmd"));
+
+  cmd_msg.data.capacity = 3;
+  cmd_msg.data.size = 3;
+  cmd_msg.data.data = (double *)calloc(3, sizeof(double));
+  feedback_msg.data.capacity = 3;
+  feedback_msg.data.size = 3;
+  feedback_msg.data.data = (double *)calloc(3, sizeof(double));
+  if (!cmd_msg.data.data || !feedback_msg.data.data) return false;
+
+  RCCHECK(rclc_executor_init(&executor, &support.context, 1, &allocator));
+  RCCHECK(rclc_executor_add_subscription(&executor, &cmd_sub, &cmd_msg, &command_callback, ON_NEW_DATA));
+
+  // Synchronize the MCU clock with the micro-ROS Agent so sensor timestamps
+  // use the same time base as ROS 2. This is important for robot_localization.
+  if (rmw_uros_sync_session(1000) != RMW_RET_OK) {
+    Serial.println("micro-ROS time sync failed");
+  } else {
+    Serial.println("micro-ROS time synchronized");
+  }
+
+  last_command_ms = millis();
+  ros_ready = true;
+  return true;
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  // Hardware/software task watchdog. If the main loop stops servicing the
+  // watchdog for 2 seconds, the ESP32 will reset instead of leaving motors
+  // uncontrolled indefinitely.
+  esp_task_wdt_init(WATCHDOG_TIMEOUT_SEC, true);
+  esp_task_wdt_add(nullptr);
+
+  setup_pins();
+  stop_all_motors();
+  init_pcnt();
+  init_imu();
+  if (!init_micro_ros()) fatal_stop();
+  last_control_ms = millis();
+  last_feedback_ms = millis();
+  last_imu_ms = millis();
+}
+
+void loop() {
+  esp_task_wdt_reset();
+  const uint32_t now = millis();
+
+  if (ros_ready) RCSOFTCHECK(rclc_executor_spin_some(&executor, RCL_MS_TO_NS(1)));
+
+  if (now - last_control_ms >= CONTROL_PERIOD_MS) {
+    const float dt = (now - last_control_ms) / 1000.0f;
+    last_control_ms = now;
+    update_velocity_measurement(dt);
+    update_pid(dt);
+  }
+
+  if (now - last_feedback_ms >= FEEDBACK_PERIOD_MS) {
+    last_feedback_ms = now;
+    publish_feedback();
+  }
+
+  if (now - last_imu_ms >= IMU_PERIOD_MS) {
+    last_imu_ms = now;
+    publish_imu();
+  }
+
+  delay(1);
+}
